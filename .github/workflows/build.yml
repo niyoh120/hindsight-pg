@@ -1,0 +1,108 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
+  schedule:
+    - cron: "0 3 * * 1" # 每周一 03:00 UTC，检查上游是否有新版本
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制重建，即使上游 tag 未变化"
+        type: boolean
+        default: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/hindsight-pg
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - name: Resolve latest upstream pgroonga tag
+        id: pick
+        run: |
+          TAG=$(curl -fsSL 'https://hub.docker.com/v2/repositories/groonga/pgroonga/tags?page_size=100' \
+            | jq -r '[.results[].name
+                     | select(endswith("-debian-17"))
+                     | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-debian-17$"))]
+                    | sort_by(split("-")[0] | split(".") | map(tonumber))
+                    | last')
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::could not resolve an upstream *-debian-17 tag"
+            exit 1
+          fi
+          echo "resolved upstream tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether a rebuild is needed
+        id: check
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            echo "forced rebuild"; echo "build=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # 每个上游版本都打一个不可变 tag；存在即说明已经构建过
+          if docker manifest inspect "$IMAGE:17-$TAG" >/dev/null 2>&1; then
+            echo "image for $TAG already published — nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "no image for $TAG — building"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            PGROONGA_TAG=${{ needs.resolve.outputs.tag }}
+          tags: |
+            ${{ env.IMAGE }}:17
+            ${{ env.IMAGE }}:17-${{ needs.resolve.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify extensions inside the image
+        run: |
+          docker run --rm --entrypoint bash "$IMAGE:17" -c \
+            'ls /usr/share/postgresql/17/extension/ | grep -E "^(vector|pgroonga)\.control$"'
